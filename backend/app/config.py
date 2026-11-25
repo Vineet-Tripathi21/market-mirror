@@ -1,6 +1,7 @@
 """\n配置管理\n统一从项目根目录的 .env 文件加载配置\n"""
 
 import ipaddress
+import math
 import os
 import re
 import secrets
@@ -32,6 +33,35 @@ _POOL_CACHE: dict = {}
 _POOL_LOCK = threading.Lock()
 
 
+# Numeric settings that did not parse. Config.validate() reports them, so startup stops with one line per
+# setting instead of a traceback from the middle of the import.
+_SETTING_ERRORS: list[str] = []
+
+
+def _env_number(name: str, default, cast, kind: str, low=None, high=None):
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = cast(raw.strip())
+    except ValueError:
+        value = None
+    if value is None or not math.isfinite(value) or (low is not None and value < low) \
+            or (high is not None and value > high):
+        bounds = f" between {low} and {high}" if low is not None and high is not None else ""
+        _SETTING_ERRORS.append(f"{name} must be {kind}{bounds} (got {raw!r})")
+        return default
+    return value
+
+
+def _env_int(name: str, default: int, low: int | None = None, high: int | None = None) -> int:
+    return _env_number(name, default, int, "a whole number", low, high)
+
+
+def _env_float(name: str, default: float) -> float:
+    return _env_number(name, default, float, "a number")
+
+
 class Config:
     """Flask配置类"""
     
@@ -40,6 +70,7 @@ class Config:
     # (development only; production refuses to start without an explicit key).
     SECRET_KEY = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
     DEBUG = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+    FLASK_PORT = _env_int('FLASK_PORT', 5001, 1, 65535)
     
     # JSON配置 - 禁用ASCII转义，让中文直接显示
     JSON_AS_ASCII = False
@@ -96,24 +127,24 @@ class Config:
         'FASTEMBED_CACHE_PATH'
     ) or os.path.abspath(os.path.join(os.path.dirname(__file__), '../uploads/models'))   # shared: read-only model files
     # Same-type entities whose names embed at least this similar are merged.
-    MEMORY_ENTITY_SIMILARITY = float(os.environ.get('MEMORY_ENTITY_SIMILARITY', '0.9'))
+    MEMORY_ENTITY_SIMILARITY = _env_float('MEMORY_ENTITY_SIMILARITY', 0.9)
     # Minimum query/document cosine for a semantic (embedding) search hit.
-    MEMORY_MIN_SIMILARITY = float(os.environ.get('MEMORY_MIN_SIMILARITY', '0.3'))
+    MEMORY_MIN_SIMILARITY = _env_float('MEMORY_MIN_SIMILARITY', 0.3)
     # Characters of one episode sent to the extraction LLM (longer text is truncated).
-    LOCAL_GRAPH_MAX_EPISODE_CHARS = int(os.environ.get('LOCAL_GRAPH_MAX_EPISODE_CHARS', '6000'))
+    LOCAL_GRAPH_MAX_EPISODE_CHARS = _env_int('LOCAL_GRAPH_MAX_EPISODE_CHARS', 6000)
     # Cognee sidecar (MEMORY_BACKEND=cognee)
     COGNEE_SIDECAR_URL = (os.environ.get('COGNEE_SIDECAR_URL') or 'http://127.0.0.1:8765').rstrip('/')
-    COGNEE_SIDECAR_TIMEOUT = float(os.environ.get('COGNEE_SIDECAR_TIMEOUT', '900'))
+    COGNEE_SIDECAR_TIMEOUT = _env_float('COGNEE_SIDECAR_TIMEOUT', 900.0)
     # Bookkeeping DB (graphs, episodes, batches, mirrored nodes/edges) for cognee.
     COGNEE_GRAPH_DB = os.environ.get('COGNEE_GRAPH_DB') or os.path.join(UPLOAD_ROOT, 'cognee_graph.db')
     # Episodes sent to one cognee add+cognify run.
-    COGNEE_INGEST_BATCH = int(os.environ.get('COGNEE_INGEST_BATCH', '20'))
+    COGNEE_INGEST_BATCH = _env_int('COGNEE_INGEST_BATCH', 20)
     LOCAL_GRAPH_DB = os.environ.get('LOCAL_GRAPH_DB') or os.path.join(UPLOAD_ROOT, 'local_graph.db')
     # Run LLM entity extraction on simulation activity episodes (costly; off by default).
     MEMORY_EXTRACT_ACTIVITY = os.environ.get('MEMORY_EXTRACT_ACTIVITY', 'false').strip().lower() in {
         '1', 'true', 'yes', 'on'
     }
-    LOCAL_GRAPH_EXTRACT_WORKERS = int(os.environ.get('LOCAL_GRAPH_EXTRACT_WORKERS', '4'))
+    LOCAL_GRAPH_EXTRACT_WORKERS = _env_int('LOCAL_GRAPH_EXTRACT_WORKERS', 4)
 
     # Zep配置 (only used when MEMORY_BACKEND=zep)
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
@@ -128,7 +159,7 @@ class Config:
     DEFAULT_CHUNK_OVERLAP = 50  # 默认重叠大小
     
     # OASIS模拟配置
-    OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
+    OASIS_DEFAULT_MAX_ROUNDS = _env_int('OASIS_DEFAULT_MAX_ROUNDS', 10)
     OASIS_SIMULATION_DATA_DIR = os.path.join(UPLOAD_ROOT, 'simulations')
     
     # OASIS平台可用动作配置
@@ -142,9 +173,9 @@ class Config:
     ]
     
     # Report Agent配置
-    REPORT_AGENT_MAX_TOOL_CALLS = int(os.environ.get('REPORT_AGENT_MAX_TOOL_CALLS', '5'))
-    REPORT_AGENT_MAX_REFLECTION_ROUNDS = int(os.environ.get('REPORT_AGENT_MAX_REFLECTION_ROUNDS', '2'))
-    REPORT_AGENT_TEMPERATURE = float(os.environ.get('REPORT_AGENT_TEMPERATURE', '0.5'))
+    REPORT_AGENT_MAX_TOOL_CALLS = _env_int('REPORT_AGENT_MAX_TOOL_CALLS', 5)
+    REPORT_AGENT_MAX_REFLECTION_ROUNDS = _env_int('REPORT_AGENT_MAX_REFLECTION_ROUNDS', 2)
+    REPORT_AGENT_TEMPERATURE = _env_float('REPORT_AGENT_TEMPERATURE', 0.5)
     
     @classmethod
     def is_local_memory(cls) -> bool:
@@ -208,9 +239,14 @@ class Config:
         cls.LLM_MODEL_NAME = env.get('LLM_MODEL_NAME') or env.get(f'{upper}_MODEL_NAME') or spec['model']
 
     @classmethod
+    def setting_errors(cls) -> list[str]:
+        """Numeric settings that did not parse (FLASK_PORT included), one line each."""
+        return list(_SETTING_ERRORS)
+
+    @classmethod
     def validate(cls) -> list[str]:
         """验证必要配置"""
-        errors: list[str] = []
+        errors: list[str] = cls.setting_errors()
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
         if not cls.LLM_BASE_URL:

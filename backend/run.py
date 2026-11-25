@@ -185,7 +185,7 @@ def startup_errors(host: str, production: bool, local_app: bool = False):
     validation for a public bind or for production deployments.
     """
     bootstrap = local_app and not production and host in ("127.0.0.1", "::1", "localhost")
-    errors = [] if bootstrap else Config.validate()
+    errors = Config.setting_errors() if bootstrap else Config.validate()
     return errors + (Config.production_errors(host) if production else [])
 
 
@@ -207,7 +207,7 @@ def main():
     # 创建应用
     app = create_app()
 
-    port = int(os.environ.get('FLASK_PORT', 5001))
+    port = Config.FLASK_PORT
     if production:
         serve_production(app, host, port)
     else:
