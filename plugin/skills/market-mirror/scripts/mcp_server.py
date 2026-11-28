@@ -737,7 +737,19 @@ TOOLS = [
 # spend approval: what a market test is about to cost, asked through elicitation
 # --------------------------------------------------------------------------
 
-USD_PER_CALL = float(os.environ.get("MARKET_MIRROR_USD_PER_CALL") or 0.005)   # ~ one claude-haiku-4-5 call
+def _env_float(name: str, default: float) -> float:
+    """Read a float from the environment; a bad value warns on stderr and uses the default (never stops the server)."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"market-mirror: ignoring {name}={raw!r} (not a number); using {default}", file=sys.stderr, flush=True)
+        return default
+
+
+USD_PER_CALL = _env_float("MARKET_MIRROR_USD_PER_CALL", 0.005)   # ~ one claude-haiku-4-5 call
 
 
 def _planned_people(cfg: Dict[str, Any]) -> Optional[int]:
@@ -1279,7 +1291,7 @@ RELATED_TASK = "io.modelcontextprotocol/related-task"
 LONG_TOOLS = {"market_test", "study", "run_test", "pitch", "email_test", "website_test", "ad_patterns", "quickstart",
               "setup", "cli"}
 TASK_TTL_MS, TASK_MAX_TTL_MS, POLL_MS = 24 * 3600 * 1000, 7 * 24 * 3600 * 1000, 5000
-ELICIT_TIMEOUT = float(os.environ.get("MARKET_MIRROR_ELICIT_TIMEOUT") or 600)
+ELICIT_TIMEOUT = _env_float("MARKET_MIRROR_ELICIT_TIMEOUT", 600)
 SERVER_INFO = {"name": "market-mirror", "version": "0.4.2"}
 INSTRUCTIONS = ("MarketMirror tests marketing and sales decisions on simulated buyers. Start with doctor; run setup if "
                 "the engine is missing; use market_test for everything; show the user the personas before approving "
@@ -1308,6 +1320,7 @@ class Session:
 
     def __init__(self, sid: str = "anonymous"):
         self.id, self.caps, self.protocol = sid, {}, None
+        self.last_used = time.monotonic()
 
 
 class Ctx:
@@ -1668,28 +1681,60 @@ def handle(msg: Dict[str, Any]) -> None:
 # ---- loopback HTTP ------------------------------------------------------------
 
 SESSIONS: Dict[str, Session] = {}
+_sessions_lock = threading.Lock()
+DEFAULT_SESSION_TTL = 3600.0
 
 
-def serve_http(port: int, token: str) -> None:
+def _session_ttl() -> float:
+    raw = os.environ.get("MARKET_MIRROR_SESSION_TTL")
+    if not raw:
+        return DEFAULT_SESSION_TTL
+    try:
+        val = float(raw)
+        if math.isfinite(val) and val > 0:
+            return val
+    except ValueError:
+        pass
+    print(f"invalid MARKET_MIRROR_SESSION_TTL={raw!r}; using {DEFAULT_SESSION_TTL}s", file=sys.stderr)
+    return DEFAULT_SESSION_TTL
+
+
+def _prune_sessions(ttl: float, now: Optional[float] = None) -> int:
+    if ttl <= 0:
+        return 0
+    cutoff = (time.monotonic() if now is None else now) - ttl
+    expired = [sid for sid, sess in SESSIONS.items() if sess.last_used <= cutoff]
+    for sid in expired:
+        SESSIONS.pop(sid, None)
+    return len(expired)
+
+
+def serve_http(port: int, token: str, session_ttl: Optional[float] = None) -> None:
     """MCP Streamable HTTP on authenticated loopback only. A request that needs the user is answered as an SSE
     stream carrying our elicitation/create first; the client POSTs its answer, then the result follows."""
     if not token or len(token) < 24:
         raise ValueError("MCP bearer token must contain at least 24 characters")
+    ttl = _session_ttl() if session_ttl is None else session_ttl
 
     class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
+        def _authorize(self) -> bool:
             if self.path != "/mcp":
                 self.send_error(404)
-                return
+                return False
             given = self.headers.get("Authorization", "")
             if not hmac.compare_digest(given, "Bearer " + token):
                 self.send_response(401)
                 self.send_header("WWW-Authenticate", "Bearer")
                 self.end_headers()
-                return
+                return False
             origin = self.headers.get("Origin", "")
             if origin and not (origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:")):
                 self.send_error(403)
+                return False
+            return True
+
+        def do_POST(self):
+            if not self._authorize():
                 return
             try:
                 size = int(self.headers.get("Content-Length", "0"))
@@ -1701,6 +1746,23 @@ def serve_http(port: int, token: str) -> None:
             except (ValueError, UnicodeDecodeError) as e:
                 self.send_error(400, str(e))
                 return
+            initialize = body.get("method") == "initialize"
+            sid = self.headers.get("Mcp-Session-Id")
+            proto_hdr = self.headers.get("MCP-Protocol-Version")
+            with _sessions_lock:
+                _prune_sessions(ttl)
+                existing = SESSIONS.get(sid) if sid else None
+                if sid and existing is None:
+                    self.send_error(404, "unknown session")
+                    return
+                if existing is not None:
+                    if proto_hdr and existing.protocol and proto_hdr != existing.protocol:
+                        self.send_error(400, f"protocol version mismatch: expected {existing.protocol}")
+                        return
+                    existing.last_used = time.monotonic()
+                elif proto_hdr and not initialize and proto_hdr not in (SUPPORTED_PROTOCOLS | STATELESS_PROTOCOLS):
+                    self.send_error(400, f"unsupported protocol version: {proto_hdr}")
+                    return
             if "method" not in body:
                 if route_response(body):
                     self.send_response(202)
@@ -1708,12 +1770,7 @@ def serve_http(port: int, token: str) -> None:
                 else:
                     self.send_error(400, "no pending request with this id")
                 return
-            sid = self.headers.get("Mcp-Session-Id")
-            if sid and sid not in SESSIONS:
-                self.send_error(404, "unknown session")
-                return
-            initialize = body.get("method") == "initialize"
-            session = Session(secrets.token_urlsafe(24)) if initialize else SESSIONS.get(sid or "") or Session()
+            session = Session(secrets.token_urlsafe(24)) if initialize else (existing or Session())
             if body.get("id") is None:
                 dispatch(body, Ctx(session))
                 self.send_response(202)
@@ -1738,7 +1795,10 @@ def serve_http(port: int, token: str) -> None:
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
                 if initialize and "result" in item:
-                    SESSIONS[session.id] = session
+                    with _sessions_lock:
+                        _prune_sessions(ttl)
+                        session.last_used = time.monotonic()
+                        SESSIONS[session.id] = session
                     self.send_header("Mcp-Session-Id", session.id)
                 self.end_headers()
                 self.wfile.write(payload)
@@ -1753,6 +1813,27 @@ def serve_http(port: int, token: str) -> None:
                 if kind == "final":
                     return
                 kind, item = outbox.get()
+
+        def do_DELETE(self):
+            if not self._authorize():
+                return
+            sid = self.headers.get("Mcp-Session-Id")
+            if not sid:
+                self.send_error(400, "Mcp-Session-Id header required")
+                return
+            proto_hdr = self.headers.get("MCP-Protocol-Version")
+            with _sessions_lock:
+                _prune_sessions(ttl)
+                existing = SESSIONS.get(sid)
+                if existing is None:
+                    self.send_error(404, "unknown session")
+                    return
+                if proto_hdr and existing.protocol and proto_hdr != existing.protocol:
+                    self.send_error(400, f"protocol version mismatch: expected {existing.protocol}")
+                    return
+                SESSIONS.pop(sid, None)
+            self.send_response(204)
+            self.end_headers()
 
         def do_GET(self):
             self.send_error(405)
@@ -1782,9 +1863,13 @@ def main() -> None:
             continue
         try:
             msg = json.loads(line)
-        except ValueError:
+        except ValueError as e:
+            print(f"mcp: invalid JSON on stdin: {e}", file=sys.stderr)
+            reply(None, error={"code": -32700, "message": "parse error"})
             continue
         if not isinstance(msg, dict):
+            print("mcp: stdin message is not a JSON object", file=sys.stderr)
+            reply(None, error={"code": -32600, "message": "invalid request"})
             continue
         if msg.get("method") in THREADED and msg.get("id") is not None:
             threading.Thread(target=handle, args=(msg,)).start()   # waits on the user or a job off the read loop
