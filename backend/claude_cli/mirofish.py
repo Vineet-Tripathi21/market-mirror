@@ -112,14 +112,19 @@ def env_file_candidates(env_file: Optional[str] = None) -> List[str]:
 
 
 def dotenv_value(raw: str) -> str:
-    """The value python-dotenv reads: the text inside a matching quote, else the part before an unquoted #."""
-    text = raw.strip()
-    if text[:1] in ("'", '"'):
-        quote = text[0]
-        end = text.find(quote, 1)
-        return text[1:end] if end != -1 else text[1:]
-    comment_at = text.find("#")
-    return (text[:comment_at] if comment_at != -1 else text).strip()
+    """One .env value as python-dotenv reads it: a quoted value ends at its closing quote (backslash escapes
+    the quote), an unquoted one at ' #'. A quote that never closes, or text after the closing quote, makes
+    python-dotenv skip the line, so the value is empty."""
+    raw = raw.strip()
+    m = re.fullmatch(r'"((?:\\.|[^"\\])*)"\s*(?:#.*)?', raw)
+    if m:
+        return re.sub(r"\\(.)", r"\1", m.group(1))
+    m = re.fullmatch(r"'((?:\\'|[^'])*)'\s*(?:#.*)?", raw)
+    if m:
+        return m.group(1).replace("\\'", "'")
+    if raw[:1] in ("'", '"'):
+        return ""
+    return re.split(r"\s+#", raw, maxsplit=1)[0].strip()
 
 
 def token_from_env_file(path: str) -> str:
